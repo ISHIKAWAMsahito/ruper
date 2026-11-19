@@ -1,0 +1,781 @@
+import 'dart:async';
+
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_shaders/flutter_shaders.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+import '../services/camera_service.dart';
+import '../services/iap_service.dart';
+import '../utils/color_filters.dart';
+import '../widgets/ring_light_frame.dart';
+import '../widgets/visibility_filter_layer.dart';
+
+/// AdMob バナーのテスト用広告ユニットID（Android）。リリース前に本番IDへ差し替えてください。
+const String _kBannerAdUnitId = 'ca-app-pub-3940256099942544/6300978111';
+
+class MagnifierScreen extends StatefulWidget {
+  const MagnifierScreen({super.key, required this.camera, required this.iap});
+
+  final CameraService camera;
+  final IapService iap;
+
+  @override
+  State<MagnifierScreen> createState() => _MagnifierScreenState();
+}
+
+class _MagnifierScreenState extends State<MagnifierScreen>
+    with WidgetsBindingObserver {
+  PermissionStatus? _permission;
+  double _baseZoom = 1.0;
+
+  /// バナーが表示されている間だけ true。メイン領域の下端セーフエリアを外すために使う。
+  final ValueNotifier<bool> _bannerVisible = ValueNotifier<bool>(false);
+
+  CameraService get cam => widget.camera;
+  IapService get iap => widget.iap;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    ShaderBuilder.precacheShader(ViewColorFilters.sharpenShaderAsset);
+    _boot();
+  }
+
+  Future<void> _boot() async {
+    var status = await Permission.camera.status;
+    if (!status.isGranted) {
+      status = await Permission.camera.request();
+    }
+    if (!mounted) return;
+    setState(() => _permission = status);
+    if (status.isGranted) {
+      await cam.initialize();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_permission?.isGranted != true) return;
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      cam.pause();
+    } else if (state == AppLifecycleState.resumed) {
+      cam.resume();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    cam.dispose();
+    _bannerVisible.dispose();
+    super.dispose();
+  }
+
+  @override
+Widget build(BuildContext context) {
+  return Scaffold(
+    backgroundColor: Colors.black,
+    body: SafeArea(
+      child: Column(
+        children: [
+          // ==========================================
+          // ① 最上部の黒い枠 ＆ バナー広告
+          // ==========================================
+          if (!_iapService.isAdsRemoved && _isBannerLoaded && _bannerAd != null)
+            Container(
+              width: double.infinity,
+              color: Colors.black, // 背景を黒枠として確保
+              alignment: Alignment.center,
+              padding: const EdgeInsets.symmetric(vertical: 4.0),
+              child: SizedBox(
+                width: _bannerAd!.size.width.toDouble(),
+                height: _bannerAd!.size.height.toDouble(),
+                child: AdWidget(ad: _bannerAd!),
+              ),
+            )
+          else
+            const SizedBox.shrink(),
+
+          // ==========================================
+          // ② ヘッダー / 設定アイコン（必要に応じて配置）
+          // ==========================================
+          Align(
+            alignment: Alignment.topRight,
+            child: IconButton(
+              icon: const Icon(Icons.settings, color: Colors.white),
+              onPressed: _showPurchaseDialog,
+            ),
+          ),
+
+          // ==========================================
+          // ③ メイン領域（カメラプレビュー ＆ 操作ボタン）
+          // ==========================================
+          Expanded(
+            child: Center(
+              // 既存のカメラファインダーや操作ボタンのウィジェット
+              child: ...
+            ),
+          ),
+
+          // ※ 以前最下部にあったバナー広告コードは削除
+        ],
+      ),
+    ),
+  );
+}
+
+  Widget _buildMain() {
+    if (_permission == null) {
+      return const SizedBox.expand();
+    }
+    if (!_permission!.isGranted) {
+      return _PermissionDenied(
+        permanentlyDenied: _permission!.isPermanentlyDenied,
+        onRetry: _boot,
+      );
+    }
+    return ListenableBuilder(
+      listenable: cam,
+      builder: (context, _) {
+        final c = cam.controller;
+        if (cam.error != null && c == null) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(
+                'カメラを起動できません\n${cam.error}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70, fontSize: 16),
+              ),
+            ),
+          );
+        }
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildViewer(c),
+            if (cam.isFront) const RingLightFrame(),
+            _buildTopBar(),
+            if (!cam.isFrozen && cam.initialized) _buildZoomSlider(),
+            _buildBottomBar(),
+          ],
+        );
+      },
+    );
+  }
+
+  // ---------------- ビューア ----------------
+  Widget _buildViewer(CameraController? c) {
+    Widget content;
+    if (cam.isFrozen) {
+      content = InteractiveViewer(
+        minScale: 1.0,
+        maxScale: 10.0,
+        child: SizedBox.expand(
+          child: _mirrorIfNeeded(
+            Image.memory(
+              cam.frozenImage!,
+              fit: BoxFit.cover,
+              gaplessPlayback: true,
+              filterQuality: FilterQuality.high,
+            ),
+          ),
+        ),
+      );
+    } else if (c != null && cam.initialized && c.value.isInitialized) {
+      final size = c.value.previewSize!;
+      content = GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onScaleStart: (_) => _baseZoom = cam.zoom,
+        onScaleUpdate: (d) {
+          if (d.pointerCount >= 2) cam.setZoom(_baseZoom * d.scale);
+        },
+        onScaleEnd: (_) => cam.persistZoom(),
+        child: SizedBox.expand(
+          child: _mirrorIfNeeded(
+            ClipRect(
+              child: FittedBox(
+                fit: BoxFit.cover,
+                child: SizedBox(
+                  width: size.height,
+                  height: size.width,
+                  child: CameraPreview(c),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    } else {
+      return const SizedBox.expand(child: ColoredBox(color: Colors.black));
+    }
+    return VisibilityFilterLayer(
+      filter: cam.isFrozen ? cam.filter : ViewFilter.none,
+      child: content,
+    );
+  }
+
+  Widget _mirrorIfNeeded(Widget child) {
+    if (cam.isFront && CameraService.mirrorFrontPreview) {
+      return Transform(
+        alignment: Alignment.center,
+        transform: Matrix4.diagonal3Values(-1.0, 1.0, 1.0),
+        child: child,
+      );
+    }
+    return child;
+  }
+
+  // ---------------- 上部バー ----------------
+  Widget _buildTopBar() {
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: Row(
+            children: [
+              _RoundButton(
+                icon: cam.torchOn ? Icons.flashlight_on : Icons.flashlight_off,
+                active: cam.torchOn,
+                enabled: !cam.isFront && !cam.isFrozen,
+                tooltip: 'ライト',
+                onPressed: cam.toggleTorch,
+              ),
+              const Spacer(),
+              _ZoomBadge(zoom: cam.zoom),
+              if (cam.filter != ViewFilter.none) ...[
+                const SizedBox(width: 8),
+                _FilterBadge(filter: cam.filter),
+              ],
+              const Spacer(),
+              ListenableBuilder(
+                listenable: iap,
+                builder: (_, __) => iap.adsRemoved
+                    ? const SizedBox(width: 48)
+                    : _RoundButton(
+                        icon: Icons.block,
+                        tooltip: '広告を非表示',
+                        onPressed: _showRemoveAdsDialog,
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------- 縦スライダー ----------------
+  Widget _buildZoomSlider() {
+    final enabled = cam.maxZoom > cam.minZoom;
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: Container(
+          margin: const EdgeInsets.only(right: 6),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: Colors.black38,
+            borderRadius: BorderRadius.circular(24),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.add, color: Colors.white70, size: 20),
+              SizedBox(
+                height: 240,
+                width: 44,
+                child: RotatedBox(
+                  quarterTurns: 3,
+                  child: SizedBox(
+                    width: 240,
+                    child: Slider(
+                      value: cam.zoom.clamp(cam.minZoom, cam.maxZoom),
+                      min: cam.minZoom,
+                      max: enabled ? cam.maxZoom : cam.minZoom + 0.01,
+                      onChanged: enabled ? cam.setZoom : null,
+                      onChangeEnd: (_) => cam.persistZoom(),
+                    ),
+                  ),
+                ),
+              ),
+              const Icon(Icons.remove, color: Colors.white70, size: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------- 下部バー ----------------
+  Widget _buildBottomBar() {
+    return SafeArea(
+      child: Align(
+        alignment: Alignment.bottomCenter,
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 24),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _RoundButton(
+                icon: Icons.cameraswitch,
+                size: 56,
+                enabled: cam.canSwitch && !cam.switching,
+                tooltip: 'インカメラ/アウトカメラ',
+                onPressed: cam.switchCamera,
+              ),
+              _ShutterButton(
+                frozen: cam.isFrozen,
+                enabled: cam.initialized,
+                onPressed: cam.isFrozen ? cam.unfreeze : cam.freeze,
+              ),
+              _RoundButton(
+                icon: cam.filter.icon,
+                size: 56,
+                active: cam.filter != ViewFilter.none,
+                tooltip: '視認性フィルター（${cam.filter.label}）',
+                onPressed: _cycleFilter,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _cycleFilter() {
+    cam.cycleFilter();
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(cam.filter.label),
+          duration: const Duration(milliseconds: 900),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+  }
+
+  // ---------------- 広告非表示ダイアログ ----------------
+  void _showRemoveAdsDialog() {
+    void closeIfRemoved() {
+      if (iap.adsRemoved && mounted && Navigator.of(context).canPop()) {
+        Navigator.of(context).pop();
+      }
+    }
+
+    iap.message = null;
+    iap.addListener(closeIfRemoved);
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => ListenableBuilder(
+        listenable: iap,
+        builder: (_, __) {
+          final price = iap.product?.price;
+          final String body;
+          if (iap.adsRemoved) {
+            body = '広告は非表示になっています。';
+          } else if (iap.storeAvailable && iap.product != null) {
+            body = '買い切り $price で、画面下部のバナー広告がすべて非表示になります。';
+          } else {
+            body = '現在ストアに接続できません。時間をおいてお試しください。';
+          }
+          final msg = iap.message;
+          return AlertDialog(
+            title: const Text('広告を非表示にする'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(body),
+                if (msg != null && !iap.adsRemoved) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    msg,
+                    style: const TextStyle(color: Colors.amber, fontSize: 13),
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              if (!iap.adsRemoved)
+                TextButton(
+                  onPressed: iap.purchasing ? null : iap.restore,
+                  child: const Text('購入を復元'),
+                ),
+              if (!iap.adsRemoved)
+                FilledButton(
+                  onPressed: iap.product != null && !iap.purchasing
+                      ? iap.buy
+                      : null,
+                  child: Text(iap.purchasing ? '処理中…' : '購入する'),
+                ),
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(),
+                child: const Text('閉じる'),
+              ),
+            ],
+          );
+        },
+      ),
+    ).whenComplete(() => iap.removeListener(closeIfRemoved));
+  }
+}
+
+// =============================================================================
+// 最下部バナー広告（アダプティブ）
+// - 読み込み完了までは SizedBox.shrink()（高さ0）でレイアウトシフトを防ぐ
+// - 購入／復元で adsRemoved になった瞬間に dispose して枠ごと消す
+// - インタースティシャル／リワードは一切使用しない
+// =============================================================================
+
+class _BottomBannerAd extends StatefulWidget {
+  const _BottomBannerAd({required this.iap, required this.onVisibleChanged});
+
+  final IapService iap;
+  final ValueChanged<bool> onVisibleChanged;
+
+  @override
+  State<_BottomBannerAd> createState() => _BottomBannerAdState();
+}
+
+class _BottomBannerAdState extends State<_BottomBannerAd> {
+  static const Duration _retryDelay = Duration(seconds: 60);
+
+  BannerAd? _ad;
+  bool _loaded = false;
+  bool _loading = false;
+  Timer? _retryTimer;
+
+  IapService get _iap => widget.iap;
+
+  @override
+  void initState() {
+    super.initState();
+    _iap.addListener(_onIapChanged);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _maybeLoad();
+  }
+
+  void _onIapChanged() {
+    if (!mounted) return;
+    if (_iap.adsRemoved) {
+      _removeAd();
+    }
+  }
+
+  /// 広告を UI から外したうえで、次フレームで dispose する
+  /// （AdWidget が接続されたまま dispose しないため）。
+  void _removeAd() {
+    _retryTimer?.cancel();
+    final old = _ad;
+    final wasVisible = _loaded;
+    _ad = null;
+    _loaded = false;
+    if (wasVisible) {
+      widget.onVisibleChanged(false);
+    }
+    setState(() {});
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+  }
+
+  Future<void> _maybeLoad() async {
+    if (_iap.adsRemoved || _ad != null || _loading) return;
+    _loading = true;
+    try {
+      final width = MediaQuery.sizeOf(context).width.truncate();
+      final size = await AdSize.getCurrentOrientationAnchoredAdaptiveBannerAdSize(
+        width,
+      );
+      if (!mounted || _iap.adsRemoved || size == null) {
+        _loading = false;
+        return;
+      }
+      // 初期化済みなら即座に返る（未初期化の場合のみ待つ）。
+      await MobileAds.instance.initialize();
+      if (!mounted || _iap.adsRemoved) {
+        _loading = false;
+        return;
+      }
+
+      final ad = BannerAd(
+        adUnitId: _kBannerAdUnitId,
+        size: size,
+        request: const AdRequest(),
+        listener: BannerAdListener(
+          onAdLoaded: (loadedAd) {
+            _loading = false;
+            if (!mounted || _iap.adsRemoved) {
+              loadedAd.dispose();
+              return;
+            }
+            setState(() => _loaded = true);
+            widget.onVisibleChanged(true);
+          },
+          onAdFailedToLoad: (failedAd, error) {
+            failedAd.dispose();
+            _loading = false;
+            if (!mounted) return;
+            if (identical(_ad, failedAd)) {
+              _ad = null;
+            }
+            _loaded = false;
+            widget.onVisibleChanged(false);
+            setState(() {});
+            _scheduleRetry();
+          },
+        ),
+      );
+      _ad = ad;
+      await ad.load();
+    } catch (_) {
+      _loading = false;
+      _ad?.dispose();
+      _ad = null;
+      if (mounted) {
+        _loaded = false;
+        widget.onVisibleChanged(false);
+        _scheduleRetry();
+      }
+    }
+  }
+
+  void _scheduleRetry() {
+    _retryTimer?.cancel();
+    _retryTimer = Timer(_retryDelay, () {
+      if (mounted) _maybeLoad();
+    });
+  }
+
+  @override
+  void dispose() {
+    _iap.removeListener(_onIapChanged);
+    _retryTimer?.cancel();
+    _ad?.dispose();
+    _ad = null;
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ad = _ad;
+    if (_iap.adsRemoved || !_loaded || ad == null) {
+      return const SizedBox.shrink();
+    }
+    return ColoredBox(
+      color: Colors.black,
+      child: SafeArea(
+        top: false,
+        child: Center(
+          child: SizedBox(
+            width: ad.size.width.toDouble(),
+            height: ad.size.height.toDouble(),
+            child: AdWidget(ad: ad),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// 部品ウィジェット
+// =============================================================================
+
+class _RoundButton extends StatelessWidget {
+  const _RoundButton({
+    required this.icon,
+    required this.onPressed,
+    this.active = false,
+    this.enabled = true,
+    this.size = 48,
+    this.tooltip,
+  });
+
+  final IconData icon;
+  final VoidCallback onPressed;
+  final bool active;
+  final bool enabled;
+  final double size;
+  final String? tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    return Opacity(
+      opacity: enabled ? 1.0 : 0.35,
+      child: Material(
+        color: active ? Colors.amber : Colors.black54,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: enabled ? onPressed : null,
+          child: SizedBox(
+            width: size,
+            height: size,
+            child: Tooltip(
+              message: tooltip ?? '',
+              child: Icon(
+                icon,
+                color: active ? Colors.black : Colors.white,
+                size: size * 0.5,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ShutterButton extends StatelessWidget {
+  const _ShutterButton({
+    required this.frozen,
+    required this.enabled,
+    required this.onPressed,
+  });
+
+  final bool frozen;
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Opacity(
+      opacity: enabled ? 1.0 : 0.4,
+      child: GestureDetector(
+        onTap: enabled ? onPressed : null,
+        child: Container(
+          width: 76,
+          height: 76,
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 4),
+            color: Colors.black38,
+          ),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: frozen ? Colors.amber : Colors.white,
+            ),
+            child: Icon(
+              frozen ? Icons.play_arrow : Icons.pause,
+              color: Colors.black87,
+              size: 32,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _FilterBadge extends StatelessWidget {
+  const _FilterBadge({required this.filter});
+
+  final ViewFilter filter;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.amber.shade700,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(filter.icon, size: 16, color: Colors.black),
+          const SizedBox(width: 4),
+          Text(
+            filter.shortLabel,
+            style: const TextStyle(
+              color: Colors.black,
+              fontSize: 13,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ZoomBadge extends StatelessWidget {
+  const _ZoomBadge({required this.zoom});
+
+  final double zoom;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(
+        '${zoom.toStringAsFixed(1)}x',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 18,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+class _PermissionDenied extends StatelessWidget {
+  const _PermissionDenied({
+    required this.permanentlyDenied,
+    required this.onRetry,
+  });
+
+  final bool permanentlyDenied;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.no_photography, size: 64, color: Colors.white54),
+            const SizedBox(height: 16),
+            const Text(
+              'ルーペとして使うには\nカメラの許可が必要です',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white, fontSize: 18),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '映像は端末内だけで処理され、外部に送信されません。',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white60, fontSize: 13),
+            ),
+            const SizedBox(height: 24),
+            FilledButton(
+              onPressed: permanentlyDenied ? openAppSettings : onRetry,
+              child: Text(permanentlyDenied ? '設定を開く' : '許可する'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
